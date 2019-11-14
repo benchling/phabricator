@@ -130,6 +130,14 @@ abstract class HeraldAdapter extends Phobject {
 
   abstract public function getHeraldName();
 
+  final public function willGetHeraldField($field_key) {
+    // This method is called during rule evaluation, before we engage the
+    // Herald profiler. We make sure we have a concrete implementation so time
+    // spent loading fields out of the classmap is not mistakenly attributed to
+    // whichever field happens to evaluate first.
+    $this->requireFieldImplementation($field_key);
+  }
+
   public function getHeraldField($field_key) {
     return $this->requireFieldImplementation($field_key)
       ->getHeraldFieldValue($this->getObject());
@@ -186,15 +194,16 @@ abstract class HeraldAdapter extends Phobject {
     return $this->appliedTransactions;
   }
 
-  public function queueTransaction($transaction) {
+  final public function queueTransaction(
+    PhabricatorApplicationTransaction $transaction) {
     $this->queuedTransactions[] = $transaction;
   }
 
-  public function getQueuedTransactions() {
+  final public function getQueuedTransactions() {
     return $this->queuedTransactions;
   }
 
-  public function newTransaction() {
+  final public function newTransaction() {
     $object = $this->newObject();
 
     if (!($object instanceof PhabricatorApplicationTransactionInterface)) {
@@ -205,7 +214,19 @@ abstract class HeraldAdapter extends Phobject {
           'PhabricatorApplicationTransactionInterface'));
     }
 
-    return $object->getApplicationTransactionTemplate();
+    $xaction = $object->getApplicationTransactionTemplate();
+
+    if (!($xaction instanceof PhabricatorApplicationTransaction)) {
+      throw new Exception(
+        pht(
+          'Expected object (of class "%s") to return a transaction template '.
+          '(of class "%s"), but it returned something else ("%s").',
+          get_class($object),
+          'PhabricatorApplicationTransaction',
+          phutil_describe_type($xaction)));
+    }
+
+    return $xaction;
   }
 
 
@@ -352,6 +373,16 @@ abstract class HeraldAdapter extends Phobject {
     return $field->getFieldGroupKey();
   }
 
+  public function isFieldAvailable($field_key) {
+    $field = $this->getFieldImplementation($field_key);
+
+    if (!$field) {
+      return null;
+    }
+
+    return $field->isFieldAvailable();
+  }
+
 
 /* -(  Conditions  )--------------------------------------------------------- */
 
@@ -368,7 +399,7 @@ abstract class HeraldAdapter extends Phobject {
       self::CONDITION_IS_NOT_ANY      => pht('is not any of'),
       self::CONDITION_INCLUDE_ALL     => pht('include all of'),
       self::CONDITION_INCLUDE_ANY     => pht('include any of'),
-      self::CONDITION_INCLUDE_NONE    => pht('do not include'),
+      self::CONDITION_INCLUDE_NONE    => pht('include none of'),
       self::CONDITION_IS_ME           => pht('is myself'),
       self::CONDITION_IS_NOT_ME       => pht('is not myself'),
       self::CONDITION_REGEXP          => pht('matches regexp'),
@@ -742,6 +773,16 @@ abstract class HeraldAdapter extends Phobject {
     }
 
     return $action->getActionGroupKey();
+  }
+
+  public function isActionAvailable($action_key) {
+    $action = $this->getActionImplementation($action_key);
+
+    if (!$action) {
+      return null;
+    }
+
+    return $action->isActionAvailable();
   }
 
   public function getActions($rule_type) {

@@ -17,6 +17,7 @@ final class PhabricatorAuthLoginController
     if ($parameter_name == 'code') {
       return true;
     }
+
     return parent::shouldAllowRestrictedParameter($parameter_name);
   }
 
@@ -34,6 +35,7 @@ final class PhabricatorAuthLoginController
       return $response;
     }
 
+    $invite = $this->loadInvite();
     $provider = $this->provider;
 
     try {
@@ -102,7 +104,7 @@ final class PhabricatorAuthLoginController
       // The account is not yet attached to a Phabricator user, so this is
       // either a registration or an account link request.
       if (!$viewer->isLoggedIn()) {
-        if ($provider->shouldAllowRegistration()) {
+        if ($provider->shouldAllowRegistration() || $invite) {
           return $this->processRegisterUser($account);
         } else {
           return $this->renderError(
@@ -236,18 +238,24 @@ final class PhabricatorAuthLoginController
     $content) {
 
     $crumbs = $this->buildApplicationCrumbs();
+    $viewer = $this->getViewer();
 
-    if ($this->getRequest()->getUser()->isLoggedIn()) {
+    if ($viewer->isLoggedIn()) {
       $crumbs->addTextCrumb(pht('Link Account'), $provider->getSettingsURI());
     } else {
-      $crumbs->addTextCrumb(pht('Log In'), $this->getApplicationURI('start/'));
+      $crumbs->addTextCrumb(pht('Login'), $this->getApplicationURI('start/'));
+
+      $content = array(
+        $this->newCustomStartMessage(),
+        $content,
+      );
     }
 
     $crumbs->addTextCrumb($provider->getProviderName());
     $crumbs->setBorder(true);
 
     return $this->newPage()
-      ->setTitle(pht('Log In'))
+      ->setTitle(pht('Login'))
       ->setCrumbs($crumbs)
       ->appendChild($content);
   }

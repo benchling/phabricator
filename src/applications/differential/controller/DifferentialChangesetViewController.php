@@ -110,10 +110,13 @@ final class DifferentialChangesetViewController extends DifferentialController {
 
     if ($left) {
       $left_data = $left->makeNewFile();
+      $left_properties = $left->getNewProperties();
       if ($right) {
         $right_data = $right->makeNewFile();
+        $right_properties = $right->getNewProperties();
       } else {
         $right_data = $left->makeOldFile();
+        $right_properties = $left->getOldProperties();
       }
 
       $engine = new PhabricatorDifferenceEngine();
@@ -123,6 +126,9 @@ final class DifferentialChangesetViewController extends DifferentialController {
 
       $choice = clone nonempty($left, $right);
       $choice->attachHunks($synthetic->getHunks());
+
+      $choice->setOldProperties($left_properties);
+      $choice->setNewProperties($right_properties);
 
       $changeset = $choice;
     }
@@ -160,6 +166,7 @@ final class DifferentialChangesetViewController extends DifferentialController {
       DifferentialChangesetParser::parseRangeSpecification($spec);
 
     $parser = id(new DifferentialChangesetParser())
+      ->setViewer($viewer)
       ->setCoverage($coverage)
       ->setChangeset($changeset)
       ->setRenderingReference($rendering_reference)
@@ -276,6 +283,7 @@ final class DifferentialChangesetViewController extends DifferentialController {
       ->setDiff($diff)
       ->setTitle(pht('Standalone View'))
       ->setBackground(PHUIObjectBoxView::BLUE_PROPERTY)
+      ->setIsStandalone(true)
       ->setParser($parser);
 
     if ($revision_id) {
@@ -419,15 +427,17 @@ final class DifferentialChangesetViewController extends DifferentialController {
   }
 
   private function loadCoverage(DifferentialChangeset $changeset) {
+    $viewer = $this->getViewer();
+
     $target_phids = $changeset->getDiff()->getBuildTargetPHIDs();
     if (!$target_phids) {
       return null;
     }
 
-    $unit = id(new HarbormasterBuildUnitMessage())->loadAllWhere(
-      'buildTargetPHID IN (%Ls)',
-      $target_phids);
-
+    $unit = id(new HarbormasterBuildUnitMessageQuery())
+      ->setViewer($viewer)
+      ->withBuildTargetPHIDs($target_phids)
+      ->execute();
     if (!$unit) {
       return null;
     }

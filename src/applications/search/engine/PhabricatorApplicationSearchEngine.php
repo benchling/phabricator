@@ -103,6 +103,14 @@ abstract class PhabricatorApplicationSearchEngine extends Phobject {
   }
 
   public function saveQuery(PhabricatorSavedQuery $query) {
+    if ($query->getID()) {
+      throw new Exception(
+        pht(
+          'Query (with ID "%s") has already been saved. Queries are '.
+          'immutable once saved.',
+          $query->getID()));
+    }
+
     $query->setEngineClassName(get_class($this));
 
     $unguarded = AphrontWriteGuard::beginScopedUnguardedWrites();
@@ -416,6 +424,19 @@ abstract class PhabricatorApplicationSearchEngine extends Phobject {
   public function getExportURI($query_key) {
     return $this->getURI('query/'.$query_key.'/export/');
   }
+
+  public function getCustomizeURI($query_key, $object_phid, $context_phid) {
+    $params = array(
+      'search.objectPHID' => $object_phid,
+      'search.contextPHID' => $context_phid,
+    );
+
+    $uri = $this->getURI('query/'.$query_key.'/customize/');
+    $uri = new PhutilURI($uri, $params);
+
+    return phutil_string_cast($uri);
+  }
+
 
 
   /**
@@ -1134,6 +1155,12 @@ abstract class PhabricatorApplicationSearchEngine extends Phobject {
     }
 
     $constraints = $request->getValue('constraints', array());
+    if (!is_array($constraints)) {
+      throw new Exception(
+        pht(
+          'Parameter "constraints" must be a map of constraints, got "%s".',
+          phutil_describe_type($constraints)));
+    }
 
     $fields = $this->getSearchFieldsForConduit();
 

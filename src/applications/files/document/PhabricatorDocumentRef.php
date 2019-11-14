@@ -11,6 +11,7 @@ final class PhabricatorDocumentRef
   private $symbolMetadata = array();
   private $blameURI;
   private $coverage = array();
+  private $data;
 
   public function setFile(PhabricatorFile $file) {
     $this->file = $file;
@@ -65,6 +66,10 @@ final class PhabricatorDocumentRef
       return $this->byteLength;
     }
 
+    if ($this->data !== null) {
+      return strlen($this->data);
+    }
+
     if ($this->file) {
       return (int)$this->file->getByteSize();
     }
@@ -72,7 +77,26 @@ final class PhabricatorDocumentRef
     return null;
   }
 
+  public function setData($data) {
+    $this->data = $data;
+    return $this;
+  }
+
   public function loadData($begin = null, $end = null) {
+    if ($this->data !== null) {
+      $data = $this->data;
+
+      if ($begin !== null && $end !== null) {
+        $data = substr($data, $begin, $end - $begin);
+      } else if ($begin !== null) {
+        $data = substr($data, $begin);
+      } else if ($end !== null) {
+        $data = substr($data, 0, $end);
+      }
+
+      return $data;
+    }
+
     if ($this->file) {
       $iterator = $this->file->getFileDataIterator($begin, $end);
 
@@ -119,11 +143,23 @@ final class PhabricatorDocumentRef
     }
 
     $snippet = $this->getSnippet();
-    if (!preg_match('/^\s*[{[]/', $snippet)) {
+
+    // If the file is longer than the snippet, we don't detect the content
+    // as JSON. We could use some kind of heuristic here if we wanted, but
+    // see PHI749 for a false positive.
+    if (strlen($snippet) < $this->getByteLength()) {
       return false;
     }
 
-    return phutil_is_utf8($snippet);
+    // If the snippet is the whole file, just check if the snippet is valid
+    // JSON. Note that `phutil_json_decode()` only accepts arrays and objects
+    // as JSON, so this won't misfire on files with content like "3".
+    try {
+      phutil_json_decode($snippet);
+      return true;
+    } catch (Exception $ex) {
+      return false;
+    }
   }
 
   public function getSnippet() {

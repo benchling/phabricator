@@ -65,10 +65,6 @@ final class DifferentialTransaction
     return new DifferentialTransactionComment();
   }
 
-  public function getApplicationTransactionViewObject() {
-    return new DifferentialTransactionView();
-  }
-
   public function shouldHide() {
     $old = $this->getOldValue();
     $new = $this->getNewValue();
@@ -134,7 +130,7 @@ final class DifferentialTransaction
   public function getActionStrength() {
     switch ($this->getTransactionType()) {
       case self::TYPE_ACTION:
-        return 3;
+        return 300;
     }
 
     return parent::getActionStrength();

@@ -6,6 +6,7 @@ final class DifferentialRevisionViewController
   private $revisionID;
   private $changesetCount;
   private $hiddenChangesets;
+  private $warnings = array();
 
   public function shouldAllowPublic() {
     return true;
@@ -50,6 +51,7 @@ final class DifferentialRevisionViewController
       ->setViewer($viewer)
       ->needReviewers(true)
       ->needReviewerAuthority(true)
+      ->needCommitPHIDs(true)
       ->executeOne();
     if (!$revision) {
       return new Aphront404Response();
@@ -68,9 +70,17 @@ final class DifferentialRevisionViewController
 
     $revision->attachActiveDiff(last($diffs));
 
-    $diff_vs = $request->getInt('vs');
-    $target_id = $request->getInt('id');
-    $target = idx($diffs, $target_id, end($diffs));
+    $diff_vs = $this->getOldDiffID($revision, $diffs);
+    if ($diff_vs instanceof AphrontResponse) {
+      return $diff_vs;
+    }
+
+    $target_id = $this->getNewDiffID($revision, $diffs);
+    if ($target_id instanceof AphrontResponse) {
+      return $target_id;
+    }
+
+    $target = $diffs[$target_id];
 
     $target_manual = $target;
     if (!$target_id) {
@@ -79,10 +89,6 @@ final class DifferentialRevisionViewController
           $target_manual = $diff;
         }
       }
-    }
-
-    if (empty($diffs[$diff_vs])) {
-      $diff_vs = null;
     }
 
     $repository = null;
@@ -141,7 +147,7 @@ final class DifferentialRevisionViewController
     $object_phids = array_merge(
       $revision->getReviewerPHIDs(),
       $subscriber_phids,
-      $revision->loadCommitPHIDs(),
+      $revision->getCommitPHIDs(),
       array(
         $revision->getAuthorPHID(),
         $viewer->getPHID(),
@@ -170,7 +176,7 @@ final class DifferentialRevisionViewController
     }
 
     $handles = $this->loadViewerHandles($object_phids);
-    $warnings = array();
+    $warnings = $this->warnings;
 
     $request_uri = $request->getRequestURI();
 
@@ -300,10 +306,6 @@ final class DifferentialRevisionViewController
     $details = $this->buildDetails($revision, $field_list);
     $curtain = $this->buildCurtain($revision);
 
-    $whitespace = $request->getStr(
-      'whitespace',
-      DifferentialChangesetParser::WHITESPACE_IGNORE_MOST);
-
     $repository = $revision->getRepository();
     if ($repository) {
       $symbol_indexes = $this->buildSymbolIndexes(
@@ -378,7 +380,6 @@ final class DifferentialRevisionViewController
         ->setDiff($target)
         ->setRenderingReferences($rendering_references)
         ->setVsMap($vs_map)
-        ->setWhitespace($whitespace)
         ->setSymbolIndexes($symbol_indexes)
         ->setTitle(pht('Diff %s', $target->getID()))
         ->setBackground(PHUIObjectBoxView::BLUE_PROPERTY);
@@ -407,7 +408,6 @@ final class DifferentialRevisionViewController
       ->setDiffUnitStatuses($broken_diffs)
       ->setSelectedVersusDiffID($diff_vs)
       ->setSelectedDiffID($target->getID())
-      ->setSelectedWhitespace($whitespace)
       ->setCommitsForLinks($commits_for_links);
 
     $local_table = id(new DifferentialLocalCommitsView())
@@ -458,7 +458,7 @@ final class DifferentialRevisionViewController
       }
     }
 
-    $tab_group = id(new PHUITabGroupView());
+    $tab_group = new PHUITabGroupView();
 
     if ($toc_view) {
       $tab_group->addTab(
@@ -468,17 +468,30 @@ final class DifferentialRevisionViewController
           ->appendChild($toc_view));
     }
 
-    $tab_group
-      ->addTab(
-        id(new PHUITabView())
-          ->setName(pht('History'))
-          ->setKey('history')
-          ->appendChild($history))
-      ->addTab(
-        id(new PHUITabView())
-          ->setName(pht('Commits'))
-          ->setKey('commits')
-          ->appendChild($local_table));
+    $tab_group->addTab(
+      id(new PHUITabView())
+        ->setName(pht('History'))
+        ->setKey('history')
+        ->appendChild($history));
+
+    $filetree_on = $viewer->compareUserSetting(
+      PhabricatorShowFiletreeSetting::SETTINGKEY,
+      PhabricatorShowFiletreeSetting::VALUE_ENABLE_FILETREE);
+
+    $collapsed_key = PhabricatorFiletreeVisibleSetting::SETTINGKEY;
+    $filetree_collapsed = (bool)$viewer->getUserSetting($collapsed_key);
+
+    // See PHI811. If the viewer has the file tree on, the files tab with the
+    // table of contents is redundant, so default to the "History" tab instead.
+    if ($filetree_on && !$filetree_collapsed) {
+      $tab_group->selectTab('history');
+    }
+
+    $tab_group->addTab(
+      id(new PHUITabView())
+        ->setName(pht('Commits'))
+        ->setKey('commits')
+        ->appendChild($local_table));
 
     $stack_graph = id(new DifferentialRevisionGraph())
       ->setViewer($viewer)
@@ -596,27 +609,18 @@ final class DifferentialRevisionViewController
     $crumbs->addTextCrumb($monogram);
     $crumbs->setBorder(true);
 
-    $filetree_on = $viewer->compareUserSetting(
-      PhabricatorShowFiletreeSetting::SETTINGKEY,
-      PhabricatorShowFiletreeSetting::VALUE_ENABLE_FILETREE);
-
     $nav = null;
     if ($filetree_on && !$this->isVeryLargeDiff()) {
-      $collapsed_key = PhabricatorFiletreeVisibleSetting::SETTINGKEY;
-      $collapsed_value = $viewer->getUserSetting($collapsed_key);
-
       $width_key = PhabricatorFiletreeWidthSetting::SETTINGKEY;
       $width_value = $viewer->getUserSetting($width_key);
 
       $nav = id(new DifferentialChangesetFileTreeSideNavBuilder())
         ->setTitle($monogram)
         ->setBaseURI(new PhutilURI($revision->getURI()))
-        ->setCollapsed((bool)$collapsed_value)
+        ->setCollapsed($filetree_collapsed)
         ->setWidth((int)$width_value)
         ->build($changesets);
     }
-
-    Javelin::initBehavior('differential-user-select');
 
     $view = id(new PHUITwoColumnView())
       ->setHeader($header)
@@ -1029,12 +1033,6 @@ final class DifferentialRevisionViewController
   }
 
 
-  /**
-   * Note this code is somewhat similar to the buildPatch method in
-   * @{class:DifferentialReviewRequestMail}.
-   *
-   * @return @{class:AphrontRedirectResponse}
-   */
   private function buildRawDiffResponse(
     DifferentialRevision $revision,
     array $changesets,
@@ -1084,10 +1082,11 @@ final class DifferentialRevisionViewController
     // this ends up being something like
     //   D123.diff
     // or the verbose
-    //   D123.vs123.id123.whitespaceignore-all.diff
+    //   D123.vs123.id123.highlightjs.diff
     // lame but nice to include these options
     $file_name = ltrim($request_uri->getPath(), '/').'.';
-    foreach ($request_uri->getQueryParams() as $key => $value) {
+    foreach ($request_uri->getQueryParamsAsPairList() as $pair) {
+      list($key, $value) = $pair;
       if ($key == 'download') {
         continue;
       }
@@ -1095,15 +1094,17 @@ final class DifferentialRevisionViewController
     }
     $file_name .= 'diff';
 
-    $unguarded = AphrontWriteGuard::beginScopedUnguardedWrites();
-      $file = PhabricatorFile::newFromFileData(
-        $raw_diff,
-        array(
-          'name' => $file_name,
-          'ttl.relative' => phutil_units('24 hours in seconds'),
-          'viewPolicy' => PhabricatorPolicies::POLICY_NOONE,
-        ));
+    $iterator = new ArrayIterator(array($raw_diff));
 
+    $source = id(new PhabricatorIteratorFileUploadSource())
+      ->setName($file_name)
+      ->setMIMEType('text/plain')
+      ->setRelativeTTL(phutil_units('24 hours in seconds'))
+      ->setViewPolicy(PhabricatorPolicies::POLICY_NOONE)
+      ->setIterator($iterator);
+
+    $unguarded = AphrontWriteGuard::beginScopedUnguardedWrites();
+      $file = $source->uploadFile();
       $file->attachToObject($revision->getPHID());
     unset($unguarded);
 
@@ -1304,12 +1305,141 @@ final class DifferentialRevisionViewController
     }
 
     return id(new HarbormasterUnitSummaryView())
-      ->setUser($viewer)
+      ->setViewer($viewer)
       ->setExcuse($excuse)
       ->setBuildable($diff->getBuildable())
       ->setUnitMessages($diff->getUnitMessages())
       ->setLimit(5)
       ->setShowViewAll(true);
+  }
+
+  private function getOldDiffID(DifferentialRevision $revision, array $diffs) {
+    assert_instances_of($diffs, 'DifferentialDiff');
+    $request = $this->getRequest();
+
+    $diffs = mpull($diffs, null, 'getID');
+
+    $is_new = ($request->getURIData('filter') === 'new');
+    $old_id = $request->getInt('vs');
+
+    // This is ambiguous, so just 404 rather than trying to figure out what
+    // the user expects.
+    if ($is_new && $old_id) {
+      return new Aphront404Response();
+    }
+
+    if ($is_new) {
+      $viewer = $this->getViewer();
+
+      $xactions = id(new DifferentialTransactionQuery())
+        ->setViewer($viewer)
+        ->withObjectPHIDs(array($revision->getPHID()))
+        ->withAuthorPHIDs(array($viewer->getPHID()))
+        ->setOrder('newest')
+        ->setLimit(1)
+        ->execute();
+
+      if (!$xactions) {
+        $this->warnings[] = id(new PHUIInfoView())
+          ->setTitle(pht('No Actions'))
+          ->setSeverity(PHUIInfoView::SEVERITY_WARNING)
+          ->appendChild(
+            pht(
+              'Showing all changes because you have never taken an '.
+              'action on this revision.'));
+      } else {
+        $xaction = head($xactions);
+
+        // Find the transactions which updated this revision. We want to
+        // figure out which diff was active when you last took an action.
+        $updates = id(new DifferentialTransactionQuery())
+          ->setViewer($viewer)
+          ->withObjectPHIDs(array($revision->getPHID()))
+          ->withTransactionTypes(
+            array(
+              DifferentialRevisionUpdateTransaction::TRANSACTIONTYPE,
+            ))
+          ->setOrder('oldest')
+          ->execute();
+
+        // Sort the diffs into two buckets: those older than your last action
+        // and those newer than your last action.
+        $older = array();
+        $newer = array();
+        foreach ($updates as $update) {
+          // If you updated the revision with "arc diff", try to count that
+          // update as "before your last action".
+          if ($update->getDateCreated() <= $xaction->getDateCreated()) {
+            $older[] = $update->getNewValue();
+          } else {
+            $newer[] = $update->getNewValue();
+          }
+        }
+
+        if (!$newer) {
+          $this->warnings[] = id(new PHUIInfoView())
+            ->setTitle(pht('No Recent Updates'))
+            ->setSeverity(PHUIInfoView::SEVERITY_WARNING)
+            ->appendChild(
+              pht(
+                'Showing all changes because the diff for this revision '.
+                'has not been updated since your last action.'));
+        } else {
+          $older = array_fuse($older);
+
+          // Find the most recent diff from before the last action.
+          $old = null;
+          foreach ($diffs as $diff) {
+            if (!isset($older[$diff->getPHID()])) {
+              break;
+            }
+
+            $old = $diff;
+          }
+
+          // It's possible we may not find such a diff: transactions may have
+          // been removed from the database, for example. If we miss, just
+          // fail into some reasonable state since 404'ing would be perplexing.
+          if ($old) {
+            $this->warnings[] = id(new PHUIInfoView())
+              ->setTitle(pht('New Changes Shown'))
+              ->setSeverity(PHUIInfoView::SEVERITY_NOTICE)
+              ->appendChild(
+                pht(
+                  'Showing changes since the last action you took on this '.
+                  'revision.'));
+
+            $old_id = $old->getID();
+          }
+        }
+      }
+    }
+
+    if (isset($diffs[$old_id])) {
+      return $old_id;
+    }
+
+    return null;
+  }
+
+  private function getNewDiffID(DifferentialRevision $revision, array $diffs) {
+    assert_instances_of($diffs, 'DifferentialDiff');
+    $request = $this->getRequest();
+
+    $diffs = mpull($diffs, null, 'getID');
+
+    $is_new = ($request->getURIData('filter') === 'new');
+    $new_id = $request->getInt('id');
+
+    if ($is_new && $new_id) {
+      return new Aphront404Response();
+    }
+
+    if (isset($diffs[$new_id])) {
+      return $new_id;
+    }
+
+    return (int)last_key($diffs);
   }
 
 }

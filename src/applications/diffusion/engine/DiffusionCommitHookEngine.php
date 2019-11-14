@@ -31,12 +31,15 @@ final class DiffusionCommitHookEngine extends Phobject {
   private $mercurialHook;
   private $mercurialCommits = array();
   private $gitCommits = array();
+  private $startTime;
 
   private $heraldViewerProjects;
   private $rejectCode = PhabricatorRepositoryPushLog::REJECT_BROKEN;
   private $rejectDetails;
   private $emailPHIDs = array();
   private $changesets = array();
+  private $changesetsSize = 0;
+  private $filesizeCache = array();
 
 
 /* -(  Config  )------------------------------------------------------------- */
@@ -67,6 +70,15 @@ final class DiffusionCommitHookEngine extends Phobject {
 
   public function getRequestIdentifier() {
     return $this->requestIdentifier;
+  }
+
+  public function setStartTime($start_time) {
+    $this->startTime = $start_time;
+    return $this;
+  }
+
+  public function getStartTime() {
+    return $this->startTime;
   }
 
   public function setSubversionTransactionInfo($transaction, $repository) {
@@ -151,6 +163,25 @@ final class DiffusionCommitHookEngine extends Phobject {
 
       if (!$is_initial_import) {
         $this->applyHeraldRefRules($ref_updates);
+      }
+
+      try {
+        if (!$is_initial_import) {
+          $this->rejectOversizedFiles($content_updates);
+        }
+      } catch (DiffusionCommitHookRejectException $ex) {
+        // If we're rejecting oversized files, flag everything.
+        $this->rejectCode = PhabricatorRepositoryPushLog::REJECT_OVERSIZED;
+        throw $ex;
+      }
+
+      try {
+        if (!$is_initial_import) {
+          $this->rejectCommitsAffectingTooManyPaths($content_updates);
+        }
+      } catch (DiffusionCommitHookRejectException $ex) {
+        $this->rejectCode = PhabricatorRepositoryPushLog::REJECT_TOUCHES;
+        throw $ex;
       }
 
       try {
@@ -428,10 +459,7 @@ final class DiffusionCommitHookEngine extends Phobject {
         $ref_type = PhabricatorRepositoryPushLog::REFTYPE_TAG;
         $ref_raw = substr($ref_raw, strlen('refs/tags/'));
       } else {
-        throw new Exception(
-          pht(
-            "Unable to identify the reftype of '%s'. Rejecting push.",
-            $ref_raw));
+        $ref_type = PhabricatorRepositoryPushLog::REFTYPE_REF;
       }
 
       $ref_update = $this->newPushLog()
@@ -1101,11 +1129,14 @@ final class DiffusionCommitHookEngine extends Phobject {
   private function newPushEvent() {
     $viewer = $this->getViewer();
 
+    $hook_start = $this->getStartTime();
+
     $event = PhabricatorRepositoryPushEvent::initializeNewEvent($viewer)
       ->setRepositoryPHID($this->getRepository()->getPHID())
       ->setRemoteAddress($this->getRemoteAddress())
       ->setRemoteProtocol($this->getRemoteProtocol())
-      ->setEpoch(PhabricatorTime::getNow());
+      ->setEpoch(PhabricatorTime::getNow())
+      ->setHookWait(phutil_microseconds_since($hook_start));
 
     $identifier = $this->getRequestIdentifier();
     if (strlen($identifier)) {
@@ -1121,11 +1152,22 @@ final class DiffusionCommitHookEngine extends Phobject {
       return;
     }
 
+    // See T13142. Don't cache more than 64MB of changesets. For normal small
+    // pushes, caching everything here can let us hit the cache from Herald if
+    // we need to run content rules, which speeds things up a bit. For large
+    // pushes, we may not be able to hold everything in memory.
+    $cache_limit = 1024 * 1024 * 64;
+
     foreach ($content_updates as $update) {
       $identifier = $update->getRefNew();
       try {
-        $changesets = $this->loadChangesetsForCommit($identifier);
-        $this->changesets[$identifier] = $changesets;
+        $info = $this->loadChangesetsForCommit($identifier);
+        list($changesets, $size) = $info;
+
+        if ($this->changesetsSize + $size <= $cache_limit) {
+          $this->changesets[$identifier] = $changesets;
+          $this->changesetsSize += $size;
+        }
       } catch (Exception $ex) {
         $this->changesets[$identifier] = $ex;
 
@@ -1200,14 +1242,18 @@ final class DiffusionCommitHookEngine extends Phobject {
 
     if (!strlen($raw_diff)) {
       // If the commit is actually empty, just return no changesets.
-      return array();
+      return array(array(), 0);
     }
 
     $parser = new ArcanistDiffParser();
     $changes = $parser->parseDiff($raw_diff);
     $diff = DifferentialDiff::newEphemeralFromRawChanges(
       $changes);
-    return $diff->getChangesets();
+
+    $changesets = $diff->getChangesets();
+    $size = strlen($raw_diff);
+
+    return array($changesets, $size);
   }
 
   public function getChangesetsForCommit($identifier) {
@@ -1221,7 +1267,95 @@ final class DiffusionCommitHookEngine extends Phobject {
       return $cached;
     }
 
-    return $this->loadChangesetsForCommit($identifier);
+    $info = $this->loadChangesetsForCommit($identifier);
+    list($changesets, $size) = $info;
+    return $changesets;
+  }
+
+  private function rejectOversizedFiles(array $content_updates) {
+    $repository = $this->getRepository();
+
+    $limit = $repository->getFilesizeLimit();
+    if (!$limit) {
+      return;
+    }
+
+    foreach ($content_updates as $update) {
+      $identifier = $update->getRefNew();
+
+      $sizes = $this->getFileSizesForCommit($identifier);
+
+      foreach ($sizes as $path => $size) {
+        if ($size <= $limit) {
+          continue;
+        }
+
+        $message = pht(
+          'OVERSIZED FILE'.
+          "\n".
+          'This repository ("%s") is configured with a maximum individual '.
+          'file size limit, but you are pushing a change ("%s") which causes '.
+          'the size of a file ("%s") to exceed the limit. The commit makes '.
+          'the file %s bytes long, but the limit for this repository is '.
+          '%s bytes.',
+          $repository->getDisplayName(),
+          $identifier,
+          $path,
+          new PhutilNumber($size),
+          new PhutilNumber($limit));
+
+        throw new DiffusionCommitHookRejectException($message);
+      }
+    }
+  }
+
+  private function rejectCommitsAffectingTooManyPaths(array $content_updates) {
+    $repository = $this->getRepository();
+
+    $limit = $repository->getTouchLimit();
+    if (!$limit) {
+      return;
+    }
+
+    foreach ($content_updates as $update) {
+      $identifier = $update->getRefNew();
+
+      $sizes = $this->getFileSizesForCommit($identifier);
+      if (count($sizes) > $limit) {
+        $message = pht(
+          'COMMIT AFFECTS TOO MANY PATHS'.
+          "\n".
+          'This repository ("%s") is configured with a touched files limit '.
+          'that caps the maximum number of paths any single commit may '.
+          'affect. You are pushing a change ("%s") which exceeds this '.
+          'limit: it affects %s paths, but the largest number of paths any '.
+          'commit may affect is %s paths.',
+          $repository->getDisplayName(),
+          $identifier,
+          phutil_count($sizes),
+          new PhutilNumber($limit));
+
+        throw new DiffusionCommitHookRejectException($message);
+      }
+    }
+  }
+
+  public function getFileSizesForCommit($identifier) {
+    if (!isset($this->filesizeCache[$identifier])) {
+      $file_sizes = $this->loadFileSizesForCommit($identifier);
+      $this->filesizeCache[$identifier] = $file_sizes;
+    }
+
+    return $this->filesizeCache[$identifier];
+  }
+
+  private function loadFileSizesForCommit($identifier) {
+    $repository = $this->getRepository();
+
+    return id(new DiffusionLowLevelFilesizeQuery())
+      ->setRepository($repository)
+      ->withIdentifier($identifier)
+      ->execute();
   }
 
   public function loadCommitRefForCommit($identifier) {

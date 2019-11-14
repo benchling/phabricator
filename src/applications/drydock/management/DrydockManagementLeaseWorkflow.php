@@ -20,9 +20,11 @@ final class DrydockManagementLeaseWorkflow
             'help' => pht('Set lease expiration time.'),
           ),
           array(
-            'name'      => 'attributes',
-            'param'     => 'name=value,...',
-            'help'      => pht('Resource specification.'),
+            'name' => 'attributes',
+            'param' => 'file',
+            'help' => pht(
+              'JSON file with lease attributes. Use "-" to read attributes '.
+              'from stdin.'),
           ),
         ));
   }
@@ -49,11 +51,20 @@ final class DrydockManagementLeaseWorkflow
       }
     }
 
-    $attributes = $args->getArg('attributes');
-    if ($attributes) {
-      $options = new PhutilSimpleOptions();
-      $options->setCaseSensitive(true);
-      $attributes = $options->parse($attributes);
+    $attributes_file = $args->getArg('attributes');
+    if (strlen($attributes_file)) {
+      if ($attributes_file == '-') {
+        echo tsprintf(
+          "%s\n",
+          'Reading JSON attributes from stdin...');
+        $data = file_get_contents('php://stdin');
+      } else {
+        $data = Filesystem::readFile($attributes_file);
+      }
+
+      $attributes = phutil_json_decode($data);
+    } else {
+      $attributes = array();
     }
 
     $lease = id(new DrydockLease())
@@ -140,13 +151,15 @@ final class DrydockManagementLeaseWorkflow
     while (!$is_active) {
       $lease->reload();
 
+      $pager = id(new AphrontCursorPagerView())
+        ->setBeforeID($log_cursor);
+
       // While we're waiting, show the user any logs which the daemons have
       // generated to give them some clue about what's going on.
       $logs = id(new DrydockLogQuery())
         ->setViewer($viewer)
         ->withLeasePHIDs(array($lease->getPHID()))
-        ->setBeforeID($log_cursor)
-        ->execute();
+        ->executeWithCursorPager($pager);
       if ($logs) {
         $logs = mpull($logs, null, 'getID');
         ksort($logs);

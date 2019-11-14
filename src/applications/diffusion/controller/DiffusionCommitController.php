@@ -45,7 +45,9 @@ final class DiffusionCommitController extends DiffusionController {
       ->withIdentifiers(array($commit_identifier))
       ->needCommitData(true)
       ->needAuditRequests(true)
+      ->needAuditAuthority(array($viewer))
       ->setLimit(100)
+      ->needIdentities(true)
       ->execute();
 
     $multiple_results = count($commits) > 1;
@@ -110,11 +112,11 @@ final class DiffusionCommitController extends DiffusionController {
     }
 
     $audit_requests = $commit->getAudits();
-    $commit->loadAndAttachAuditAuthority($viewer);
 
     $commit_data = $commit->getCommitData();
     $is_foreign = $commit_data->getCommitDetail('foreign-svn-stub');
     $error_panel = null;
+    $unpublished_panel = null;
 
     $hard_limit = 1000;
 
@@ -170,13 +172,12 @@ final class DiffusionCommitController extends DiffusionController {
         ->setHeaderIcon('fa-code-fork')
         ->addTag($commit_tag);
 
-      if ($commit->getAuditStatus()) {
-        $icon = PhabricatorAuditCommitStatusConstants::getStatusIcon(
-          $commit->getAuditStatus());
-        $color = PhabricatorAuditCommitStatusConstants::getStatusColor(
-          $commit->getAuditStatus());
-        $status = PhabricatorAuditCommitStatusConstants::getStatusName(
-          $commit->getAuditStatus());
+      if (!$commit->isAuditStatusNoAudit()) {
+        $status = $commit->getAuditStatusObject();
+
+        $icon = $status->getIcon();
+        $color = $status->getColor();
+        $status = $status->getName();
 
         $header->setStatus($icon, $color, $status);
       }
@@ -240,6 +241,51 @@ final class DiffusionCommitController extends DiffusionController {
             'reachable from any branch, tag, or ref.');
         }
       }
+      if (!$commit->isPermanentCommit()) {
+        $nonpermanent_tag = id(new PHUITagView())
+          ->setType(PHUITagView::TYPE_SHADE)
+          ->setName(pht('Unpublished'))
+          ->setColor(PHUITagView::COLOR_ORANGE);
+
+        $header->addTag($nonpermanent_tag);
+
+        $holds = $commit_data->newPublisherHoldReasons();
+
+        $reasons = array();
+        foreach ($holds as $hold) {
+          $reasons[] = array(
+            phutil_tag('strong', array(), pht('%s:', $hold->getName())),
+            ' ',
+            $hold->getSummary(),
+          );
+        }
+
+        if (!$holds) {
+          $reasons[] = pht('No further details are available.');
+        }
+
+        $doc_href = PhabricatorEnv::getDoclink(
+          'Diffusion User Guide: Permanent Refs');
+        $doc_link = phutil_tag(
+          'a',
+          array(
+            'href' => $doc_href,
+            'target' => '_blank',
+          ),
+          pht('Learn More'));
+
+        $title = array(
+          pht('Unpublished Commit'),
+          pht(" \xC2\xB7 "),
+          $doc_link,
+        );
+
+        $unpublished_panel = id(new PHUIInfoView())
+          ->setTitle($title)
+          ->setErrors($reasons)
+          ->setSeverity(PHUIInfoView::SEVERITY_WARNING);
+      }
+
 
       if ($this->getCommitErrors()) {
         $error_panel = id(new PHUIInfoView())
@@ -432,23 +478,36 @@ final class DiffusionCommitController extends DiffusionController {
         ->setWidth((int)$width);
     }
 
+    $description_box = id(new PHUIObjectBoxView())
+      ->setHeaderText(pht('Description'))
+      ->setBackground(PHUIObjectBoxView::BLUE_PROPERTY)
+      ->appendChild($detail_list);
+
+    $detail_box = id(new PHUIObjectBoxView())
+      ->setHeaderText(pht('Details'))
+      ->setBackground(PHUIObjectBoxView::BLUE_PROPERTY)
+      ->appendChild($details);
+
     $view = id(new PHUITwoColumnView())
       ->setHeader($header)
       ->setSubheader($subheader)
-      ->setMainColumn(array(
-        $error_panel,
-        $timeline,
-        $merge_table,
-        $info_panel,
-      ))
-      ->setFooter(array(
-        $change_table,
-        $change_list,
-        $add_comment,
-      ))
-      ->addPropertySection(pht('Description'), $detail_list)
-      ->addPropertySection(pht('Details'), $details)
-      ->setCurtain($curtain);
+      ->setCurtain($curtain)
+      ->setMainColumn(
+        array(
+          $unpublished_panel,
+          $error_panel,
+          $description_box,
+          $detail_box,
+          $timeline,
+          $merge_table,
+          $info_panel,
+        ))
+      ->setFooter(
+        array(
+          $change_table,
+          $change_list,
+          $add_comment,
+        ));
 
     $page = $this->newPage()
       ->setTitle($commit->getDisplayName())
@@ -504,15 +563,13 @@ final class DiffusionCommitController extends DiffusionController {
 
     $phids = $edge_query->getDestinationPHIDs(array($commit_phid));
 
-    if ($data->getCommitDetail('authorPHID')) {
-      $phids[] = $data->getCommitDetail('authorPHID');
-    }
+
     if ($data->getCommitDetail('reviewerPHID')) {
       $phids[] = $data->getCommitDetail('reviewerPHID');
     }
-    if ($data->getCommitDetail('committerPHID')) {
-      $phids[] = $data->getCommitDetail('committerPHID');
-    }
+
+    $phids[] = $commit->getCommitterDisplayPHID();
+    $phids[] = $commit->getAuthorDisplayPHID();
 
     // NOTE: We should never normally have more than a single push log, but
     // it can occur naturally if a commit is pushed, then the branch it was
@@ -573,24 +630,11 @@ final class DiffusionCommitController extends DiffusionController {
       }
     }
 
-    $author_phid = $data->getCommitDetail('authorPHID');
-    $author_name = $data->getAuthorName();
     $author_epoch = $data->getCommitDetail('authorEpoch');
 
     $committed_info = id(new PHUIStatusItemView())
-      ->setNote(phabricator_datetime($commit->getEpoch(), $viewer));
-
-    $committer_phid = $data->getCommitDetail('committerPHID');
-    $committer_name = $data->getCommitDetail('committer');
-    if ($committer_phid) {
-      $committed_info->setTarget($handles[$committer_phid]->renderLink());
-    } else if (strlen($committer_name)) {
-      $committed_info->setTarget($committer_name);
-    } else if ($author_phid) {
-      $committed_info->setTarget($handles[$author_phid]->renderLink());
-    } else if (strlen($author_name)) {
-      $committed_info->setTarget($author_name);
-    }
+      ->setNote(phabricator_datetime($commit->getEpoch(), $viewer))
+      ->setTarget($commit->renderAnyCommitter($viewer, $handles));
 
     $committed_list = new PHUIStatusListView();
     $committed_list->addItem($committed_info);
@@ -716,7 +760,7 @@ final class DiffusionCommitController extends DiffusionController {
       return null;
     }
 
-    $author_phid = $data->getCommitDetail('authorPHID');
+    $author_phid = $commit->getAuthorDisplayPHID();
     $author_name = $data->getAuthorName();
     $author_epoch = $data->getCommitDetail('authorEpoch');
     $date = null;
@@ -748,16 +792,12 @@ final class DiffusionCommitController extends DiffusionController {
       ->setImage($image_uri)
       ->setImageHref($image_href)
       ->setContent($content);
-
   }
-
 
   private function buildComments(PhabricatorRepositoryCommit $commit) {
     $timeline = $this->buildTransactionTimeline(
       $commit,
       new PhabricatorAuditTransactionQuery());
-
-    $commit->willRenderTimeline($timeline, $this->getRequest());
 
     $timeline->setQuoteRef($commit->getMonogram());
 
@@ -812,8 +852,6 @@ final class DiffusionCommitController extends DiffusionController {
       ->setUser($viewer)
       ->setDiffusionRequest($drequest)
       ->setHistory($merges);
-
-    $history_table->loadRevisions();
 
     $panel = id(new PHUIObjectBoxView())
       ->setHeaderText(pht('Merged Changes'))

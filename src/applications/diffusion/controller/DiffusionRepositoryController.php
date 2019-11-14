@@ -145,13 +145,26 @@ final class DiffusionRepositoryController extends DiffusionController {
       ->setRight(array($this->branchButton, $actions_button, $clone_button))
       ->addClass('diffusion-action-bar');
 
+    $status_view = null;
+    if ($repository->isReadOnly()) {
+      $status_view = id(new PHUIInfoView())
+        ->setSeverity(PHUIInfoView::SEVERITY_WARNING)
+        ->setErrors(
+          array(
+            phutil_escape_html_newlines(
+              $repository->getReadOnlyMessageForDisplay()),
+          ));
+    }
+
     $view = id(new PHUITwoColumnView())
       ->setHeader($header)
-      ->setFooter(array(
-        $bar,
-        $description,
-        $content,
-      ));
+      ->setFooter(
+        array(
+          $status_view,
+          $bar,
+          $description,
+          $content,
+        ));
 
     if ($page_has_content) {
       $view->setTabs($tabs);
@@ -327,6 +340,8 @@ final class DiffusionRepositoryController extends DiffusionController {
 
     if (!$repository->isTracked()) {
       $header->setStatus('fa-ban', 'dark', pht('Inactive'));
+    } else if ($repository->isReadOnly()) {
+      $header->setStatus('fa-wrench', 'indigo', pht('Under Maintenance'));
     } else if ($repository->isImporting()) {
       $ratio = $repository->loadImportProgress();
       $percentage = sprintf('%.2f%%', 100 * $ratio);
@@ -334,6 +349,8 @@ final class DiffusionRepositoryController extends DiffusionController {
         'fa-clock-o',
         'indigo',
         pht('Importing (%s)...', $percentage));
+    } else if ($repository->isPublishingDisabled()) {
+      $header->setStatus('fa-minus', 'bluegrey', pht('Publishing Disabled'));
     } else {
       $header->setStatus('fa-check', 'bluegrey', pht('Active'));
     }
@@ -370,8 +387,17 @@ final class DiffusionRepositoryController extends DiffusionController {
       $action_view->addAction(
         id(new PhabricatorActionView())
           ->setName(pht('View Push Logs'))
-          ->setIcon('fa-list-alt')
+          ->setIcon('fa-upload')
           ->setHref($push_uri));
+
+      $pull_uri = $this->getApplicationURI(
+        'synclog/?repositories='.$repository->getPHID());
+
+      $action_view->addAction(
+        id(new PhabricatorActionView())
+          ->setName(pht('View Sync Logs'))
+          ->setIcon('fa-exchange')
+          ->setHref($pull_uri));
     }
 
     $pull_uri = $this->getApplicationURI(
@@ -380,7 +406,7 @@ final class DiffusionRepositoryController extends DiffusionController {
     $action_view->addAction(
       id(new PhabricatorActionView())
         ->setName(pht('View Pull Logs'))
-        ->setIcon('fa-list-alt')
+        ->setIcon('fa-download')
         ->setHref($pull_uri));
 
     return $action_view;
@@ -429,16 +455,12 @@ final class DiffusionRepositoryController extends DiffusionController {
     $history_table = id(new DiffusionHistoryTableView())
       ->setUser($viewer)
       ->setDiffusionRequest($drequest)
-      ->setHistory($history);
-
-    // TODO: Super sketchy.
-    $history_table->loadRevisions();
+      ->setHistory($history)
+      ->setIsHead(true);
 
     if ($history_results) {
       $history_table->setParents($history_results['parents']);
     }
-
-    $history_table->setIsHead(true);
 
     $panel = id(new PHUIObjectBoxView())
       ->setBackground(PHUIObjectBoxView::BLUE_PROPERTY)

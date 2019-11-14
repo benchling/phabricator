@@ -30,6 +30,9 @@ final class PHUITimelineEventView extends AphrontView {
   private $badges = array();
   private $pinboardItems = array();
   private $isSilent;
+  private $isMFA;
+  private $isLockOverride;
+  private $canInteract;
 
   public function setAuthorPHID($author_phid) {
     $this->authorPHID = $author_phid;
@@ -112,6 +115,15 @@ final class PHUITimelineEventView extends AphrontView {
     return $this->isEditable;
   }
 
+  public function setCanInteract($can_interact) {
+    $this->canInteract = $can_interact;
+    return $this;
+  }
+
+  public function getCanInteract() {
+    return $this->canInteract;
+  }
+
   public function setIsRemovable($is_removable) {
     $this->isRemovable = $is_removable;
     return $this;
@@ -185,6 +197,24 @@ final class PHUITimelineEventView extends AphrontView {
 
   public function getIsSilent() {
     return $this->isSilent;
+  }
+
+  public function setIsMFA($is_mfa) {
+    $this->isMFA = $is_mfa;
+    return $this;
+  }
+
+  public function getIsMFA() {
+    return $this->isMFA;
+  }
+
+  public function setIsLockOverride($is_override) {
+    $this->isLockOverride = $is_override;
+    return $this;
+  }
+
+  public function getIsLockOverride() {
+    return $this->isLockOverride;
   }
 
   public function setReallyMajorEvent($me) {
@@ -392,7 +422,7 @@ final class PHUITimelineEventView extends AphrontView {
     $wedge = phutil_tag(
       'div',
       array(
-        'class' => 'phui-timeline-wedge phui-timeline-border',
+        'class' => 'phui-timeline-wedge',
         'style' => (nonempty($image_uri)) ? '' : 'display: none;',
       ),
       '');
@@ -400,12 +430,13 @@ final class PHUITimelineEventView extends AphrontView {
     $image = null;
     $badges = null;
     if ($image_uri) {
-      $image = phutil_tag(
+      $image = javelin_tag(
         ($this->userHandle->getURI()) ? 'a' : 'div',
         array(
           'style' => 'background-image: url('.$image_uri.')',
           'class' => 'phui-timeline-image',
           'href' => $this->userHandle->getURI(),
+          'aural' => false,
         ),
         '');
       if ($this->badges && $show_badges) {
@@ -451,7 +482,7 @@ final class PHUITimelineEventView extends AphrontView {
     $content = phutil_tag(
       'div',
       array(
-        'class' => 'phui-timeline-group phui-timeline-border',
+        'class' => 'phui-timeline-group',
       ),
       $content);
 
@@ -587,8 +618,25 @@ final class PHUITimelineEventView extends AphrontView {
       // not expect to have received any mail or notifications.
       if ($this->getIsSilent()) {
         $extra[] = id(new PHUIIconView())
-          ->setIcon('fa-bell-slash', 'red')
+          ->setIcon('fa-bell-slash', 'white')
+          ->setEmblemColor('red')
           ->setTooltip(pht('Silent Edit'));
+      }
+
+      // If this edit was applied while the actor was in high-security mode,
+      // provide a hint that it was extra authentic.
+      if ($this->getIsMFA()) {
+        $extra[] = id(new PHUIIconView())
+          ->setIcon('fa-vcard', 'white')
+          ->setEmblemColor('pink')
+          ->setTooltip(pht('MFA Authenticated'));
+      }
+
+      if ($this->getIsLockOverride()) {
+        $extra[] = id(new PHUIIconView())
+          ->setIcon('fa-chain-broken', 'white')
+          ->setEmblemColor('violet')
+          ->setTooltip(pht('Lock Overridden'));
       }
     }
 
@@ -612,6 +660,10 @@ final class PHUITimelineEventView extends AphrontView {
   private function getMenuItems($anchor) {
     $xaction_phid = $this->getTransactionPHID();
 
+    $can_interact = $this->getCanInteract();
+    $viewer = $this->getViewer();
+    $is_admin = $viewer->getIsAdmin();
+
     $items = array();
 
     if ($this->getIsEditable()) {
@@ -620,6 +672,7 @@ final class PHUITimelineEventView extends AphrontView {
         ->setHref('/transactions/edit/'.$xaction_phid.'/')
         ->setName(pht('Edit Comment'))
         ->addSigil('transaction-edit')
+        ->setDisabled(!$can_interact)
         ->setMetadata(
           array(
             'anchor' => $anchor,
@@ -689,17 +742,23 @@ final class PHUITimelineEventView extends AphrontView {
       $items[] = id(new PhabricatorActionView())
         ->setType(PhabricatorActionView::TYPE_DIVIDER);
 
-      $items[] = id(new PhabricatorActionView())
+      $remove_item = id(new PhabricatorActionView())
         ->setIcon('fa-trash-o')
         ->setHref('/transactions/remove/'.$xaction_phid.'/')
         ->setName(pht('Remove Comment'))
-        ->setColor(PhabricatorActionView::RED)
         ->addSigil('transaction-remove')
         ->setMetadata(
           array(
             'anchor' => $anchor,
           ));
 
+      if (!$is_admin && !$can_interact) {
+        $remove_item->setDisabled(!$is_admin && !$can_interact);
+      } else {
+        $remove_item->setColor(PhabricatorActionView::RED);
+      }
+
+      $items[] = $remove_item;
     }
 
     return $items;

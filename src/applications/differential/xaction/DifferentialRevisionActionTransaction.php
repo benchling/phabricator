@@ -40,7 +40,7 @@ abstract class DifferentialRevisionActionTransaction
   }
 
   public function getActionStrength() {
-    return 3;
+    return 300;
   }
 
   public function getRevisionActionOrderVector() {
@@ -53,6 +53,11 @@ abstract class DifferentialRevisionActionTransaction
   }
 
   protected function getRevisionActionDescription(
+    DifferentialRevision $revision) {
+    return null;
+  }
+
+  protected function getRevisionActionSubmitButtonText(
     DifferentialRevision $revision) {
     return null;
   }
@@ -109,6 +114,9 @@ abstract class DifferentialRevisionActionTransaction
 
         $group_key = $this->getRevisionActionGroupKey();
         $field->setCommentActionGroupKey($group_key);
+
+        $button_text = $this->getRevisionActionSubmitButtonText($revision);
+        $field->setActionSubmitButtonText($button_text);
 
         // Currently, every revision action conflicts with every other
         // revision action: for example, you can not simultaneously Accept and

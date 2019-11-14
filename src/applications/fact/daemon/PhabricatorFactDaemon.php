@@ -15,7 +15,7 @@ final class PhabricatorFactDaemon extends PhabricatorDaemon {
       }
 
       $this->log(pht('Zzz...'));
-      $this->sleep(60 * 5);
+      $this->sleep(15);
     }
   }
 
@@ -189,7 +189,7 @@ final class PhabricatorFactDaemon extends PhabricatorDaemon {
             $conn,
             'INSERT INTO %T
               (keyID, objectID, dimensionID, value, epoch)
-              VALUES %Q',
+              VALUES %LQ',
             $table_name,
             $chunk);
         }

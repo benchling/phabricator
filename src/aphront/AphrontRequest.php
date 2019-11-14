@@ -383,6 +383,15 @@ final class AphrontRequest extends Phobject {
     return $this->validateCSRF();
   }
 
+  public function hasCSRF() {
+    try {
+      $this->validateCSRF();
+      return true;
+    } catch (AphrontMalformedRequestException $ex) {
+      return false;
+    }
+  }
+
   public function isFormOrHisecPost() {
     $post = $this->getExists(self::TYPE_FORM) &&
             $this->isHTTPPost();
@@ -591,10 +600,11 @@ final class AphrontRequest extends Phobject {
   }
 
   public function getRequestURI() {
-    $get = $_GET;
-    unset($get['__path__']);
-    $path = phutil_escape_uri($this->getPath());
-    return id(new PhutilURI($path))->setQueryParams($get);
+    $uri_path = phutil_escape_uri($this->getPath());
+    $uri_query = idx($_SERVER, 'QUERY_STRING', '');
+
+    return id(new PhutilURI($uri_path.'?'.$uri_query))
+      ->removeQueryParam('__path__');
   }
 
   public function getAbsoluteRequestURI() {
@@ -653,7 +663,7 @@ final class AphrontRequest extends Phobject {
   }
 
   public function isContinueRequest() {
-    return $this->isFormPost() && $this->getStr('__continue__');
+    return $this->isFormOrHisecPost() && $this->getStr('__continue__');
   }
 
   public function isPreviewRequest() {
@@ -824,7 +834,10 @@ final class AphrontRequest extends Phobject {
     }
 
     $uri->setPath($this->getPath());
-    $uri->setQueryParams(self::flattenData($_GET));
+    $uri->removeAllQueryParams();
+    foreach (self::flattenData($_GET) as $query_key => $query_value) {
+      $uri->appendQueryParam($query_key, $query_value);
+    }
 
     $input = PhabricatorStartup::getRawInput();
 

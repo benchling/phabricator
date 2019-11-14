@@ -14,41 +14,39 @@ final class DiffusionGitReceivePackSSHWorkflow extends DiffusionGitSSHWorkflow {
   }
 
   protected function executeRepositoryOperations() {
+    // This is a write, and must have write access.
+    $this->requireWriteAccess();
+
+    $is_proxy = $this->shouldProxy();
+    if ($is_proxy) {
+      return $this->executeRepositoryProxyOperations($for_write = true);
+    }
+
     $host_wait_start = microtime(true);
 
     $repository = $this->getRepository();
     $viewer = $this->getSSHUser();
     $device = AlmanacKeys::getLiveDevice();
 
-    // This is a write, and must have write access.
-    $this->requireWriteAccess();
-
     $cluster_engine = id(new DiffusionRepositoryClusterEngine())
       ->setViewer($viewer)
       ->setRepository($repository)
       ->setLog($this);
 
-    if ($this->shouldProxy()) {
-      $command = $this->getProxyCommand(true);
-      $did_synchronize = false;
+    $command = csprintf('git-receive-pack %s', $repository->getLocalPath());
+    $cluster_engine->synchronizeWorkingCopyBeforeWrite();
 
-      if ($device) {
-        $this->writeClusterEngineLogMessage(
-          pht(
-            "# Push received by \"%s\", forwarding to cluster host.\n",
-            $device->getName()));
-      }
-    } else {
-      $command = csprintf('git-receive-pack %s', $repository->getLocalPath());
-      $did_synchronize = true;
-      $cluster_engine->synchronizeWorkingCopyBeforeWrite();
+    if ($device) {
+      $this->writeClusterEngineLogMessage(
+        pht(
+          "# Ready to receive on cluster host \"%s\".\n",
+          $device->getName()));
+    }
 
-      if ($device) {
-        $this->writeClusterEngineLogMessage(
-          pht(
-            "# Ready to receive on cluster host \"%s\".\n",
-            $device->getName()));
-      }
+    $log = $this->newProtocolLog($is_proxy);
+    if ($log) {
+      $this->setProtocolLog($log);
+      $log->didStartSession($command);
     }
 
     $caught = null;
@@ -58,21 +56,27 @@ final class DiffusionGitReceivePackSSHWorkflow extends DiffusionGitSSHWorkflow {
       $caught = $ex;
     }
 
+    if ($log) {
+      $log->didEndSession();
+    }
+
     // We've committed the write (or rejected it), so we can release the lock
     // without waiting for the client to receive the acknowledgement.
-    if ($did_synchronize) {
-      $cluster_engine->synchronizeWorkingCopyAfterWrite();
-    }
+    $cluster_engine->synchronizeWorkingCopyAfterWrite();
 
     if ($caught) {
       throw $caught;
     }
 
     if (!$err) {
+      $this->waitForGitClient();
+
+      // When a repository is clustered, we reach this cleanup code on both
+      // the proxy and the actual final endpoint node. Don't do more cleanup
+      // or logging than we need to.
       $repository->writeStatusMessage(
         PhabricatorRepositoryStatusMessage::TYPE_NEEDS_UPDATE,
         PhabricatorRepositoryStatusMessage::CODE_OKAY);
-      $this->waitForGitClient();
 
       $host_wait_end = microtime(true);
 
@@ -80,7 +84,6 @@ final class DiffusionGitReceivePackSSHWorkflow extends DiffusionGitSSHWorkflow {
         $this->getClusterEngineLogProperty('writeWait'),
         $this->getClusterEngineLogProperty('readWait'),
         ($host_wait_end - $host_wait_start));
-
     }
 
     return $err;

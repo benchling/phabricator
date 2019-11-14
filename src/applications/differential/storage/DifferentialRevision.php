@@ -11,6 +11,7 @@ final class DifferentialRevision extends DifferentialDAO
     PhabricatorSubscribableInterface,
     PhabricatorCustomFieldInterface,
     PhabricatorApplicationTransactionInterface,
+    PhabricatorTimelineInterface,
     PhabricatorMentionableInterface,
     PhabricatorDestructibleInterface,
     PhabricatorProjectInterface,
@@ -40,7 +41,7 @@ final class DifferentialRevision extends DifferentialDAO
   protected $editPolicy = PhabricatorPolicies::POLICY_USER;
   protected $properties = array();
 
-  private $commits = self::ATTACHABLE;
+  private $commitPHIDs = self::ATTACHABLE;
   private $activeDiff = self::ATTACHABLE;
   private $diffIDs = self::ATTACHABLE;
   private $hashes = self::ATTACHABLE;
@@ -52,8 +53,6 @@ final class DifferentialRevision extends DifferentialDAO
   private $flags = array();
   private $forceMap = array();
 
-  const TABLE_COMMIT          = 'differential_commit';
-
   const RELATION_REVIEWER     = 'revw';
   const RELATION_SUBSCRIBED   = 'subd';
 
@@ -63,6 +62,7 @@ final class DifferentialRevision extends DifferentialDAO
   const PROPERTY_LINES_ADDED = 'lines.added';
   const PROPERTY_LINES_REMOVED = 'lines.removed';
   const PROPERTY_BUILDABLES = 'buildables';
+  const PROPERTY_WRONG_BUILDS = 'wrong.builds';
 
   public static function initializeNewRevision(PhabricatorUser $actor) {
     $app = id(new PhabricatorApplicationQuery())
@@ -112,11 +112,6 @@ final class DifferentialRevision extends DifferentialDAO
         'repositoryPHID' => 'phid?',
       ),
       self::CONFIG_KEY_SCHEMA => array(
-        'key_phid' => null,
-        'phid' => array(
-          'columns' => array('phid'),
-          'unique' => true,
-        ),
         'authorPHID' => array(
           'columns' => array('authorPHID', 'status'),
         ),
@@ -130,6 +125,9 @@ final class DifferentialRevision extends DifferentialDAO
         // edge table.
         'key_status' => array(
           'columns' => array('status', 'phid'),
+        ),
+        'key_modified' => array(
+          'columns' => array('dateModified'),
         ),
       ),
     ) + parent::getConfiguration();
@@ -157,35 +155,8 @@ final class DifferentialRevision extends DifferentialDAO
     return '/'.$this->getMonogram();
   }
 
-  public function loadIDsByCommitPHIDs($phids) {
-    if (!$phids) {
-      return array();
-    }
-    $revision_ids = queryfx_all(
-      $this->establishConnection('r'),
-      'SELECT * FROM %T WHERE commitPHID IN (%Ls)',
-      self::TABLE_COMMIT,
-      $phids);
-    return ipull($revision_ids, 'revisionID', 'commitPHID');
-  }
-
-  public function loadCommitPHIDs() {
-    if (!$this->getID()) {
-      return ($this->commits = array());
-    }
-
-    $commits = queryfx_all(
-      $this->establishConnection('r'),
-      'SELECT commitPHID FROM %T WHERE revisionID = %d',
-      self::TABLE_COMMIT,
-      $this->getID());
-    $commits = ipull($commits, 'commitPHID');
-
-    return ($this->commits = $commits);
-  }
-
   public function getCommitPHIDs() {
-    return $this->assertAttached($this->commits);
+    return $this->assertAttached($this->commitPHIDs);
   }
 
   public function getActiveDiff() {
@@ -213,7 +184,7 @@ final class DifferentialRevision extends DifferentialDAO
   }
 
   public function attachCommitPHIDs(array $phids) {
-    $this->commits = array_values($phids);
+    $this->commitPHIDs = $phids;
     return $this;
   }
 
@@ -876,7 +847,7 @@ final class DifferentialRevision extends DifferentialDAO
     PhabricatorUser $viewer,
     array $phids) {
 
-    return id(new HarbormasterBuildQuery())
+    $builds = id(new HarbormasterBuildQuery())
       ->setViewer($viewer)
       ->withBuildablePHIDs($phids)
       ->withAutobuilds(false)
@@ -892,6 +863,41 @@ final class DifferentialRevision extends DifferentialDAO
           HarbormasterBuildStatus::STATUS_DEADLOCKED,
         ))
       ->execute();
+
+    // Filter builds based on the "Hold Drafts" behavior of their associated
+    // build plans.
+
+    $hold_drafts = HarbormasterBuildPlanBehavior::BEHAVIOR_DRAFTS;
+    $behavior = HarbormasterBuildPlanBehavior::getBehavior($hold_drafts);
+
+    $key_never = HarbormasterBuildPlanBehavior::DRAFTS_NEVER;
+    $key_building = HarbormasterBuildPlanBehavior::DRAFTS_IF_BUILDING;
+
+    foreach ($builds as $key => $build) {
+      $plan = $build->getBuildPlan();
+      $hold_key = $behavior->getPlanOption($plan)->getKey();
+
+      $hold_never = ($hold_key === $key_never);
+      $hold_building = ($hold_key === $key_building);
+
+      // If the build "Never" holds drafts from promoting, we don't care what
+      // the status is.
+      if ($hold_never) {
+        unset($builds[$key]);
+        continue;
+      }
+
+      // If the build holds drafts from promoting "While Building", we only
+      // care about the status until it completes.
+      if ($hold_building) {
+        if ($build->isComplete()) {
+          unset($builds[$key]);
+          continue;
+        }
+      }
+    }
+
+    return $builds;
   }
 
 
@@ -990,79 +996,8 @@ final class DifferentialRevision extends DifferentialDAO
     return new DifferentialTransactionEditor();
   }
 
-  public function getApplicationTransactionObject() {
-    return $this;
-  }
-
   public function getApplicationTransactionTemplate() {
     return new DifferentialTransaction();
-  }
-
-  public function willRenderTimeline(
-    PhabricatorApplicationTransactionView $timeline,
-    AphrontRequest $request) {
-    $viewer = $request->getViewer();
-
-    $render_data = $timeline->getRenderData();
-    $left = $request->getInt('left', idx($render_data, 'left'));
-    $right = $request->getInt('right', idx($render_data, 'right'));
-
-    $diffs = id(new DifferentialDiffQuery())
-      ->setViewer($request->getUser())
-      ->withIDs(array($left, $right))
-      ->execute();
-    $diffs = mpull($diffs, null, 'getID');
-    $left_diff = $diffs[$left];
-    $right_diff = $diffs[$right];
-
-    $old_ids = $request->getStr('old', idx($render_data, 'old'));
-    $new_ids = $request->getStr('new', idx($render_data, 'new'));
-    $old_ids = array_filter(explode(',', $old_ids));
-    $new_ids = array_filter(explode(',', $new_ids));
-
-    $type_inline = DifferentialTransaction::TYPE_INLINE;
-    $changeset_ids = array_merge($old_ids, $new_ids);
-    $inlines = array();
-    foreach ($timeline->getTransactions() as $xaction) {
-      if ($xaction->getTransactionType() == $type_inline) {
-        $inlines[] = $xaction->getComment();
-        $changeset_ids[] = $xaction->getComment()->getChangesetID();
-      }
-    }
-
-    if ($changeset_ids) {
-      $changesets = id(new DifferentialChangesetQuery())
-        ->setViewer($request->getUser())
-        ->withIDs($changeset_ids)
-        ->execute();
-      $changesets = mpull($changesets, null, 'getID');
-    } else {
-      $changesets = array();
-    }
-
-    foreach ($inlines as $key => $inline) {
-      $inlines[$key] = DifferentialInlineComment::newFromModernComment(
-        $inline);
-    }
-
-    $query = id(new DifferentialInlineCommentQuery())
-      ->needHidden(true)
-      ->setViewer($viewer);
-
-    // NOTE: This is a bit sketchy: this method adjusts the inlines as a
-    // side effect, which means it will ultimately adjust the transaction
-    // comments and affect timeline rendering.
-    $query->adjustInlinesForChangesets(
-      $inlines,
-      array_select_keys($changesets, $old_ids),
-      array_select_keys($changesets, $new_ids),
-      $this);
-
-    return $timeline
-      ->setChangesets($changesets)
-      ->setRevision($this)
-      ->setLeftDiff($left_diff)
-      ->setRightDiff($right_diff);
   }
 
 
@@ -1082,12 +1017,6 @@ final class DifferentialRevision extends DifferentialDAO
       }
 
       $conn_w = $this->establishConnection('w');
-
-      queryfx(
-        $conn_w,
-        'DELETE FROM %T WHERE revisionID = %d',
-        self::TABLE_COMMIT,
-        $this->getID());
 
       // we have to do paths a little differently as they do not have
       // an id or phid column for delete() to act on
@@ -1148,6 +1077,24 @@ final class DifferentialRevision extends DifferentialDAO
         ->setKey('summary')
         ->setType('string')
         ->setDescription(pht('Revision summary.')),
+      id(new PhabricatorConduitSearchFieldSpecification())
+        ->setKey('testPlan')
+        ->setType('string')
+        ->setDescription(pht('Revision test plan.')),
+      id(new PhabricatorConduitSearchFieldSpecification())
+        ->setKey('isDraft')
+        ->setType('bool')
+        ->setDescription(
+          pht(
+            'True if this revision is in any draft state, and thus not '.
+            'notifying reviewers and subscribers about changes.')),
+      id(new PhabricatorConduitSearchFieldSpecification())
+        ->setKey('holdAsDraft')
+        ->setType('bool')
+        ->setDescription(
+          pht(
+            'True if this revision is being held as a draft. It will not be '.
+            'automatically submitted for review even if tests pass.')),
     );
   }
 
@@ -1167,6 +1114,9 @@ final class DifferentialRevision extends DifferentialDAO
       'repositoryPHID' => $this->getRepositoryPHID(),
       'diffPHID' => $this->getActiveDiffPHID(),
       'summary' => $this->getSummary(),
+      'testPlan' => $this->getTestPlan(),
+      'isDraft' => !$this->getShouldBroadcast(),
+      'holdAsDraft' => (bool)$this->getHoldAsDraft(),
     );
   }
 
@@ -1184,5 +1134,14 @@ final class DifferentialRevision extends DifferentialDAO
   public function newDraftEngine() {
     return new DifferentialRevisionDraftEngine();
   }
+
+
+/* -(  PhabricatorTimelineInterface  )--------------------------------------- */
+
+
+  public function newTimelineEngine() {
+    return new DifferentialRevisionTimelineEngine();
+  }
+
 
 }
